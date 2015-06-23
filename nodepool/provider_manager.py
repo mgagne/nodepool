@@ -26,6 +26,7 @@ import requests.exceptions
 import sys
 
 import shade
+import neutronclient
 import novaclient
 
 from nodeutils import iterate_timeout
@@ -37,6 +38,11 @@ IPS_LIST_AGE = 5      # How long to keep a cached copy of the ip list
 
 
 def get_public_ip(server, version=4):
+    if 'access_network' in server.metadata:
+        net_label = server.metadata['access_network']
+        for addr in server.addresses.get(net_label, []):
+            if addr['version'] == version:
+                return addr['addr']
     for addr in server.addresses.get('public', []):
         if type(addr) == type(u''):  # Rackspace/openstack 1.0
             return addr
@@ -248,6 +254,15 @@ class FindNetworkTask(Task):
                 return dict(id=str(network['id']))
 
 
+class GetNetworkTask(Task):
+    def main(self, client):
+        try:
+            net = client.neutron_client.get_network(self.args['id'])
+        except neutronclient.exceptions.NotFound:
+            raise NotFound()
+        return dict(id=str(net['id']), name=net['name'])
+
+
 class ProviderManager(TaskManager):
     log = logging.getLogger("nodepool.ProviderManager")
 
@@ -344,6 +359,9 @@ class ProviderManager(TaskManager):
         self._networks[label] = network
         return network
 
+    def getNetwork(self, id):
+        return self.submitTask(GetNetworkTask(id=id))
+
     def deleteImage(self, name):
         if name in self._images:
             del self._images[name]
@@ -375,12 +393,15 @@ class ProviderManager(TaskManager):
             create_args['key_name'] = key_name
         if az:
             create_args['availability_zone'] = az
+        access_network = None
         if self.provider.use_neutron:
             nics = []
             for network in self.provider.networks:
                 if 'net-id' in network:
+                    access_network = self.getNetwork(network['net-id'])['name']
                     nics.append({'net-id': network['net-id']})
                 elif 'net-label' in network:
+                    access_network = network['net-label']
                     net_id = self.findNetwork(network['net-label'])['id']
                     nics.append({'net-id': net_id})
                 else:
@@ -405,7 +426,8 @@ class ProviderManager(TaskManager):
             groups=json.dumps(groups_meta),
             nodepool=json.dumps(nodepool_meta)
         )
-
+        if access_network:
+            create_args['meta']['access_network'] = access_network
         return self.submitTask(CreateServerTask(**create_args))
 
     def getServer(self, server_id):
